@@ -11,6 +11,7 @@ import {
 	stream as streamOpenAICodexResponses,
 	streamSimple as streamSimpleOpenAICodexResponses,
 } from "../src/api/openai-codex-responses.ts";
+import { clampOpenAIPromptCacheKey } from "../src/api/openai-prompt-cache.ts";
 import type { Context, Model } from "../src/types.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
@@ -685,7 +686,7 @@ describe("openai-codex streaming", () => {
 		expect(capturedBody).not.toHaveProperty("prompt_cache_key");
 	});
 
-	it("clamps prompt_cache_key to OpenAI's 64-character limit", async () => {
+	it("normalizes prompt_cache_key to OpenAI's 64-character limit without dropping suffix identity", async () => {
 		const token = mockToken();
 		const sessionId = "x".repeat(67);
 		let capturedPayload: { prompt_cache_key?: string } | undefined;
@@ -732,10 +733,10 @@ describe("openai-codex streaming", () => {
 			},
 		}).result();
 
-		expect(capturedPayload?.prompt_cache_key).toBe("x".repeat(64));
+		expect(capturedPayload?.prompt_cache_key).toBe(clampOpenAIPromptCacheKey(sessionId));
 	});
 
-	it("clamps Codex session-id header to 64 characters", async () => {
+	it("separates Codex cache affinity from the full conversation id", async () => {
 		const token = mockToken();
 		const sessionId = "x".repeat(67);
 		let capturedHeaders: Headers | undefined;
@@ -779,8 +780,9 @@ describe("openai-codex streaming", () => {
 			sessionId,
 		}).result();
 
-		expect(capturedHeaders?.get("session-id")).toBe("x".repeat(64));
-		expect(capturedHeaders?.get("x-client-request-id")).toBe("x".repeat(64));
+		expect(capturedHeaders?.get("session-id")).toBe(clampOpenAIPromptCacheKey(sessionId));
+		expect(capturedHeaders?.get("thread-id")).toBe(sessionId);
+		expect(capturedHeaders?.get("x-client-request-id")).toBe(sessionId);
 	});
 
 	it("preserves gpt-5.5 xhigh reasoning effort from simple options", async () => {
@@ -2181,6 +2183,146 @@ describe("openai-codex streaming", () => {
 			fullContextRequests: 1,
 			deltaRequests: 1,
 			lastDeltaInputItems: 2,
+			lastPreviousResponseId: "resp_1",
+		});
+	});
+
+	it("preserves websocket-cached continuation across reasoning effort updates", async () => {
+		const token = mockToken();
+		const sentBodies: Array<{
+			input?: unknown[];
+			previous_response_id?: string;
+			reasoning?: { effort?: string; summary?: string };
+		}> = [];
+
+		class MockWebSocket {
+			static OPEN = 1;
+			readyState = MockWebSocket.OPEN;
+			private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+			constructor(_url: string, _protocols?: string | string[] | { headers?: Record<string, string> }) {
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				let listeners = this.listeners.get(type);
+				if (!listeners) {
+					listeners = new Set();
+					this.listeners.set(type, listeners);
+				}
+				listeners.add(listener);
+			}
+
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+
+			send(data: string): void {
+				const body = JSON.parse(data) as (typeof sentBodies)[number];
+				sentBodies.push(body);
+				const index = sentBodies.length;
+				const responseId = `resp_${index}`;
+				const messageId = `msg_${index}`;
+				const text = `answer-${index}`;
+				const events = [
+					{ type: "response.created", response: { id: responseId } },
+					{
+						type: "response.output_item.added",
+						item: { type: "message", id: messageId, role: "assistant", status: "in_progress", content: [] },
+					},
+					{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+					{ type: "response.output_text.delta", delta: text },
+					{
+						type: "response.output_item.done",
+						item: {
+							type: "message",
+							id: messageId,
+							role: "assistant",
+							status: "completed",
+							content: [{ type: "output_text", text }],
+						},
+					},
+					{
+						type: "response.completed",
+						response: {
+							id: responseId,
+							status: "completed",
+							usage: {
+								input_tokens: 5,
+								output_tokens: 3,
+								total_tokens: 8,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				];
+				queueMicrotask(() => {
+					for (const event of events) this.dispatch("message", { data: JSON.stringify(event) });
+				});
+			}
+
+			close(): void {
+				this.readyState = 3;
+			}
+
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) listener(event);
+			}
+		}
+
+		vi.stubGlobal("WebSocket", MockWebSocket);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			thinkingLevelMap: { off: null, low: "low", high: "high" },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+			compat: { supportsReasoningEffortUpdates: true },
+		};
+		const sessionId = "effort-update-session";
+		const firstContext = normalizeContext({
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "First", timestamp: 1 }],
+		});
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId,
+			transport: "websocket-cached",
+			reasoningEffort: "low",
+		}).result();
+		expect(first.providerThinkingLevel).toBe("low");
+
+		const secondContext = normalizeContext({
+			messages: [...firstContext.messages, first, { role: "user", content: "Second", timestamp: 2 }],
+		});
+		const second = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId,
+			transport: "websocket-cached",
+			reasoningEffort: "high",
+		}).result();
+		expect(second.providerThinkingLevel).toBe("high");
+
+		expect(sentBodies).toHaveLength(2);
+		expect(sentBodies[0].reasoning).toEqual({ effort: "low", summary: "auto" });
+		expect(sentBodies[1].reasoning).toEqual({ effort: "low", summary: "auto" });
+		expect(sentBodies[1].previous_response_id).toBe("resp_1");
+		expect(sentBodies[1].input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "Second" }] },
+			{ type: "configuration_update", reasoning: { effort: "high" } },
+		]);
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toMatchObject({
+			connectionsCreated: 1,
+			connectionsReused: 1,
+			fullContextRequests: 1,
+			deltaRequests: 1,
 			lastPreviousResponseId: "resp_1",
 		});
 	});

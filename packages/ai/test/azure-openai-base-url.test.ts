@@ -2,6 +2,7 @@ import { arch, platform, release } from "node:os";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAzureOpenAIResponses } from "../src/api/azure-openai-responses.ts";
+import { clampOpenAIPromptCacheKey } from "../src/api/openai-prompt-cache.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
 import type { Context, Model } from "../src/types.ts";
 
@@ -162,15 +163,16 @@ describe("azure-openai-responses base URL normalization", () => {
 		expect(result.errorMessage).toContain("Invalid Azure OpenAI base URL");
 	});
 
-	it("clamps prompt_cache_key to OpenAI's 64-character limit", async () => {
+	it("normalizes prompt_cache_key to OpenAI's 64-character limit", async () => {
 		const model = getModel("azure-openai-responses", "gpt-4o-mini");
+		const sessionId = "x".repeat(67);
 		await streamAzureOpenAIResponses(model, normalizeContext(context), {
 			apiKey: "test-api-key",
 			azureBaseUrl: "https://my-resource.openai.azure.com",
-			sessionId: "x".repeat(67),
+			sessionId,
 		}).result();
 
-		expect(azureMock.lastParams?.prompt_cache_key).toBe("x".repeat(64));
+		expect(azureMock.lastParams?.prompt_cache_key).toBe(clampOpenAIPromptCacheKey(sessionId));
 	});
 
 	it("disables server-side response storage", async () => {

@@ -384,6 +384,7 @@ const OPENAI_CODEX_ADDITIONAL_TOOLS_MODEL_IDS = new Set([
 	"gpt-6-sol",
 	"gpt-6-luna",
 ]);
+const OPENAI_REASONING_EFFORT_UPDATE_MODEL_IDS = new Set(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
 const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272000;
 const OPENAI_SHORT_CONTEXT_CAPPED_MODEL_IDS = new Set([
 	"gpt-5.4",
@@ -946,6 +947,21 @@ function applyOpenAIResponsesTranscriptMetadata(model: Model<Api>): void {
 		...(model.compat as OpenAIResponsesCompat | undefined),
 		supportsMidConvoSystemMessages: true,
 		...(isProxiedResponses ? { supportsAdditionalTools: true } : {}),
+	};
+}
+
+function applyOpenAIReasoningEffortUpdateMetadata(model: Model<Api>): void {
+	const isOpenAIResponses =
+		model.provider === "openai" &&
+		model.api === "openai-responses" &&
+		OPENAI_REASONING_EFFORT_UPDATE_MODEL_IDS.has(model.id);
+	// The ChatGPT Codex catalog currently advertises this capability only for Astra.
+	const isOpenAICodexAstra =
+		model.provider === "openai-codex" && model.api === "openai-codex-responses" && model.id === "gpt-6-astra";
+	if (!isOpenAIResponses && !isOpenAICodexAstra) return;
+	model.compat = {
+		...(model.compat as OpenAIResponsesCompat | undefined),
+		supportsReasoningEffortUpdates: true,
 	};
 }
 
@@ -3281,6 +3297,7 @@ async function generateModels() {
 		applyOpenAIToolSearchMetadata(model);
 		applyOpenAICompletionsTranscriptMetadata(model);
 		applyOpenAIResponsesTranscriptMetadata(model);
+		applyOpenAIReasoningEffortUpdateMetadata(model);
 		applyOpenAIExplicitPromptCacheMetadata(model);
 		applyPromptCacheMetadata(model);
 		applyImageInputMetadata(model);

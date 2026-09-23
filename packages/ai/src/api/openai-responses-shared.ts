@@ -18,6 +18,7 @@ import type {
 	Api,
 	AssistantMessage,
 	ImageContent,
+	Message,
 	Model,
 	StopReason,
 	SystemMessage,
@@ -126,6 +127,8 @@ export interface ConvertResponsesMessagesOptions {
 	supportsMidConvoSystemMessages?: boolean;
 	supportsAdditionalTools?: boolean;
 	supportsToolSearch?: boolean;
+	/** Request-level effort pinned for the active cache epoch. Enables replay of historical `configuration_update` items. */
+	reasoningEffortBaseline?: string;
 	toolOptions?: ConvertResponsesToolsOptions;
 }
 
@@ -134,6 +137,67 @@ export interface ConvertResponsesToolsOptions {
 	supportsStrictMode?: boolean;
 	supportsOpenAIGrammarTools?: boolean;
 	toolSearchResult?: boolean;
+}
+
+export interface ResponsesReasoningEffortState {
+	baselineEffort: string;
+	effectiveEffort: string;
+}
+
+function isManagedResponsesAssistant<TApi extends Api>(
+	model: Model<TApi>,
+	message: Message,
+): message is AssistantMessage & { providerThinkingLevel: string } {
+	return (
+		message.role === "assistant" &&
+		message.api === model.api &&
+		message.provider === model.provider &&
+		message.model === model.id &&
+		message.stopReason !== "error" &&
+		message.stopReason !== "aborted" &&
+		typeof message.providerThinkingLevel === "string" &&
+		message.providerThinkingLevel.length > 0
+	);
+}
+
+function findReasoningEffortEpochStart<TApi extends Api>(model: Model<TApi>, messages: readonly Message[]): number {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role === "assistant" && !isManagedResponsesAssistant(model, message)) return index + 1;
+	}
+	return 0;
+}
+
+/** Resolve the stable request-level effort and the latest in-history override for this model epoch. */
+export function getResponsesReasoningEffortState<TApi extends Api>(
+	model: Model<TApi>,
+	messages: readonly Message[],
+	activeEffort: string,
+): ResponsesReasoningEffortState {
+	const epochStart = findReasoningEffortEpochStart(model, messages);
+	let baselineEffort = activeEffort;
+	let effectiveEffort = activeEffort;
+	let sawManagedAssistant = false;
+
+	for (let index = epochStart; index < messages.length; index++) {
+		const message = messages[index];
+		if (!isManagedResponsesAssistant(model, message)) continue;
+		if (!sawManagedAssistant) {
+			baselineEffort = message.providerThinkingLevel;
+			sawManagedAssistant = true;
+		}
+		effectiveEffort = message.providerThinkingLevel;
+	}
+
+	return { baselineEffort, effectiveEffort };
+}
+
+/** The installed OpenAI SDK may lag the Responses wire schema, so keep this small wire item local. */
+export function createResponsesReasoningEffortUpdate(effort: string): ResponseInputItem {
+	return {
+		type: "configuration_update",
+		reasoning: { effort },
+	} as unknown as ResponseInputItem;
 }
 
 // =============================================================================
@@ -175,6 +239,11 @@ export function convertResponsesMessages<TApi extends Api>(
 	};
 
 	const transformedMessages = transformMessages(normalizedContext.messages, model, normalizeToolCallId);
+	const reasoningEffortEpochStart =
+		options?.reasoningEffortBaseline === undefined
+			? transformedMessages.length
+			: findReasoningEffortEpochStart(model, transformedMessages);
+	let replayedReasoningEffort = options?.reasoningEffortBaseline;
 	const transcriptTools = resolveTranscriptTools(
 		normalizedContext.messages,
 		(options?.supportsAdditionalTools ?? false) || (options?.supportsToolSearch ?? false),
@@ -215,7 +284,8 @@ export function convertResponsesMessages<TApi extends Api>(
 	let msgIndex = 0;
 	let sourceIndex = 0;
 	for (const msg of transformedMessages) {
-		const isLeadingSystemMessage = sourceIndex++ === 0 && msg.role === "system";
+		const currentSourceIndex = sourceIndex++;
+		const isLeadingSystemMessage = currentSourceIndex === 0 && msg.role === "system";
 		if (msg.role === "system") {
 			if (!isLeadingSystemMessage) appendSystemToolAdditions(msg, `system:${msgIndex}`);
 			if (!isLeadingSystemMessage || includeInitialSystemMessage) {
@@ -327,6 +397,15 @@ export function convertResponsesMessages<TApi extends Api>(
 				}
 			}
 			if (output.length === 0) continue;
+			if (
+				replayedReasoningEffort !== undefined &&
+				currentSourceIndex >= reasoningEffortEpochStart &&
+				isManagedResponsesAssistant(model, assistantMsg) &&
+				assistantMsg.providerThinkingLevel !== replayedReasoningEffort
+			) {
+				messages.push(createResponsesReasoningEffortUpdate(assistantMsg.providerThinkingLevel));
+				replayedReasoningEffort = assistantMsg.providerThinkingLevel;
+			}
 			messages.push(...output);
 		} else if (msg.role === "toolResult") {
 			const [callId] = msg.toolCallId.split("|");

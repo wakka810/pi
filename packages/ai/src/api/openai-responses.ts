@@ -25,7 +25,13 @@ import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	createResponsesReasoningEffortUpdate,
+	getResponsesReasoningEffortState,
+	processResponsesStream,
+} from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -75,6 +81,7 @@ function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCo
 		supportsOpenAIGrammarTools: model.compat?.supportsOpenAIGrammarTools ?? false,
 		supportsAdditionalTools: model.compat?.supportsAdditionalTools ?? false,
 		supportsToolSearch: model.compat?.supportsToolSearch ?? false,
+		supportsReasoningEffortUpdates: model.compat?.supportsReasoningEffortUpdates ?? false,
 		supportsExplicitPromptCacheMode: model.compat?.supportsExplicitPromptCacheMode ?? false,
 		supportsMaxOutputTokens: model.compat?.supportsMaxOutputTokens ?? true,
 	};
@@ -105,6 +112,21 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	toolChoice?: ResponseCreateParamsStreaming["tool_choice"];
+}
+
+function resolveReasoningEffort(
+	model: Model<"openai-responses">,
+	options: OpenAIResponsesOptions | undefined,
+): string | undefined {
+	if (!model.reasoning) return undefined;
+	if (options?.reasoningEffort !== undefined) {
+		return model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+	}
+	if (options?.reasoningSummary) return "medium";
+	if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
+		return model.thinkingLevelMap?.off ?? "none";
+	}
+	return undefined;
 }
 
 /**
@@ -143,7 +165,11 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
+			const cacheAffinityId = clampOpenAIPromptCacheKey(cacheSessionId);
 			const compat = getCompat(model);
+			const providerThinkingLevel = compat.supportsReasoningEffortUpdates
+				? resolveReasoningEffort(model, options)
+				: undefined;
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				getDeclaredTools(normalizedContext.messages),
 				compat.supportsOpenAIGrammarTools,
@@ -154,9 +180,17 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				apiKey,
 				options?.headers,
 				options?.fetch,
+				cacheAffinityId,
 				cacheSessionId,
 			);
-			let params = buildParams(model, normalizedContext, options, compat, grammarToolInputProperties);
+			let params = buildParams(
+				model,
+				normalizedContext,
+				options,
+				compat,
+				grammarToolInputProperties,
+				cacheAffinityId,
+			);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
@@ -193,6 +227,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
+			if (providerThinkingLevel !== undefined) output.providerThinkingLevel = providerThinkingLevel;
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
@@ -242,7 +277,8 @@ function createClient(
 	apiKey: string,
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
-	sessionId?: string,
+	cacheAffinityId?: string,
+	conversationId?: string,
 ) {
 	const compat = getCompat(model);
 	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
@@ -255,14 +291,16 @@ function createClient(
 		Object.assign(headers, copilotHeaders);
 	}
 
-	if (sessionId) {
+	if (cacheAffinityId || conversationId) {
 		if (compat.sessionAffinityFormat === "openrouter") {
-			headers["x-session-id"] = sessionId;
+			const sessionId = conversationId ?? cacheAffinityId;
+			if (sessionId) headers["x-session-id"] = sessionId;
 		} else {
-			if (compat.sessionAffinityFormat === "openai") {
-				headers.session_id = sessionId;
+			if (compat.sessionAffinityFormat === "openai" && cacheAffinityId) {
+				headers.session_id = cacheAffinityId;
 			}
-			headers["x-client-request-id"] = sessionId;
+			const requestId = conversationId ?? cacheAffinityId;
+			if (requestId) headers["x-client-request-id"] = requestId;
 		}
 	}
 
@@ -289,7 +327,13 @@ function buildParams(
 		getDeclaredTools(context.messages),
 		compat.supportsOpenAIGrammarTools,
 	),
+	cacheAffinityId?: string,
 ) {
+	const activeReasoningEffort = resolveReasoningEffort(model, options);
+	const reasoningEffortState =
+		compat.supportsReasoningEffortUpdates && activeReasoningEffort !== undefined
+			? getResponsesReasoningEffortState(model, context.messages, activeReasoningEffort)
+			: undefined;
 	const transcriptTools = resolveTranscriptTools(
 		context.messages,
 		compat.supportsAdditionalTools || compat.supportsToolSearch,
@@ -299,11 +343,19 @@ function buildParams(
 		supportsMidConvoSystemMessages: compat.supportsMidConvoSystemMessages,
 		supportsAdditionalTools: compat.supportsAdditionalTools,
 		supportsToolSearch: compat.supportsToolSearch,
+		reasoningEffortBaseline: reasoningEffortState?.baselineEffort,
 		toolOptions: {
 			supportsStrictMode: compat.supportsStrictMode,
 			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
 		},
 	});
+	if (
+		reasoningEffortState &&
+		activeReasoningEffort !== undefined &&
+		reasoningEffortState.effectiveEffort !== activeReasoningEffort
+	) {
+		messages.push(createResponsesReasoningEffortUpdate(activeReasoningEffort));
+	}
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	const params: ResponseCreateParamsStreaming & {
@@ -312,7 +364,7 @@ function buildParams(
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
+		prompt_cache_key: cacheRetention === "none" ? undefined : cacheAffinityId,
 		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
 		prompt_cache_options: getPromptCacheOptions(compat, cacheRetention),
 		store: false,
@@ -342,19 +394,18 @@ function buildParams(
 	}
 
 	if (model.reasoning) {
-		if (options?.reasoningEffort || options?.reasoningSummary) {
-			const effort = options?.reasoningEffort
-				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
-				: "medium";
+		if (activeReasoningEffort !== undefined) {
+			const requestReasoningEffort = reasoningEffortState?.baselineEffort ?? activeReasoningEffort;
+			const offEffort = model.thinkingLevelMap?.off === null ? undefined : (model.thinkingLevelMap?.off ?? "none");
+			const includeReasoningSummary =
+				options?.reasoningEffort !== undefined ||
+				options?.reasoningSummary !== undefined ||
+				requestReasoningEffort !== offEffort;
 			params.reasoning = {
-				effort: effort as NonNullable<typeof params.reasoning>["effort"],
-				summary: options?.reasoningSummary || "auto",
+				effort: requestReasoningEffort as NonNullable<typeof params.reasoning>["effort"],
+				...(includeReasoningSummary ? { summary: options?.reasoningSummary || "auto" } : {}),
 			};
-			params.include = ["reasoning.encrypted_content"];
-		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
-			params.reasoning = {
-				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
-			};
+			if (includeReasoningSummary) params.include = ["reasoning.encrypted_content"];
 		}
 		if (model.provider === "xai") params.include = ["reasoning.encrypted_content"];
 	}

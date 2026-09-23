@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
+import { clampOpenAIPromptCacheKey } from "../src/api/openai-prompt-cache.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
 import type { Model } from "../src/types.ts";
 
@@ -126,11 +127,11 @@ describe("openai-completions prompt caching", () => {
 		expect(payload?.prompt_cache_retention).toBe("24h");
 	});
 
-	it("clamps prompt_cache_key to OpenAI's 64-character limit", async () => {
+	it("normalizes prompt_cache_key to OpenAI's 64-character limit", async () => {
 		const sessionId = "x".repeat(67);
 		const { payload } = await captureRequest({ sessionId });
 
-		expect(payload?.prompt_cache_key).toBe("x".repeat(64));
+		expect(payload?.prompt_cache_key).toBe(clampOpenAIPromptCacheKey(sessionId));
 	});
 
 	it("omits prompt cache fields when cacheRetention is none", async () => {

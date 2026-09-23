@@ -106,6 +106,21 @@ function mergeCompat(
 	return merged;
 }
 
+function mergeCompatForProviderBaseUrlOverride(model: Model<Api>, config: ModelsJsonProvider): Model<Api>["compat"] {
+	const merged = mergeCompat(model.compat, config.compat);
+	const hasExplicitPromptCacheOverride =
+		config.compat !== undefined && Object.hasOwn(config.compat, "supportsExplicitPromptCacheMode");
+	if (
+		config.baseUrl !== undefined &&
+		config.baseUrl !== model.baseUrl &&
+		model.api === "openai-responses" &&
+		!hasExplicitPromptCacheOverride
+	) {
+		return { ...(merged as object | undefined), supportsExplicitPromptCacheMode: false } as Model<Api>["compat"];
+	}
+	return merged;
+}
+
 function mergeInputLimits(
 	base: Model<Api>["inputLimits"],
 	override: ModelsJsonModelOverride["inputLimits"],
@@ -232,7 +247,7 @@ function applyModelsJson(
 	const models: Model<Api>[] = baseModels.map((model) => ({
 		...model,
 		baseUrl: config.oauth === "radius" ? model.baseUrl : (config.baseUrl ?? model.baseUrl),
-		compat: mergeCompat(model.compat, config.compat),
+		compat: mergeCompatForProviderBaseUrlOverride(model, config),
 	}));
 	for (const definition of config.models ?? []) {
 		const existingIndex = models.findIndex((model) => model.id === definition.id);

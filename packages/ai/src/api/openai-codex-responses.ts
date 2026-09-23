@@ -42,7 +42,13 @@ import {
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	createResponsesReasoningEffortUpdate,
+	getResponsesReasoningEffortState,
+	processResponsesStream,
+} from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 // ============================================================================
@@ -82,6 +88,23 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	textVerbosity?: "low" | "medium" | "high";
 	toolChoice?: "auto" | "none" | "required";
+}
+
+function resolveReasoningEffort(
+	model: Model<"openai-codex-responses">,
+	options: OpenAICodexResponsesOptions | undefined,
+): string | undefined {
+	if (!model.reasoning) return undefined;
+	if (options?.reasoningEffort !== undefined) {
+		if (options.reasoningEffort === "none") {
+			const offEffort = model.thinkingLevelMap?.off;
+			return offEffort === undefined ? "none" : (offEffort ?? undefined);
+		}
+		return model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+	}
+	if (options?.reasoningSummary) return "medium";
+	if (model.thinkingLevelMap?.off !== null) return model.thinkingLevelMap?.off ?? "none";
+	return undefined;
 }
 
 type CodexResponseStatus = "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress";
@@ -273,20 +296,31 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				model.compat?.supportsOpenAIGrammarTools ?? false,
 			);
 			const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
-			const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
-			let body = buildRequestBody(model, normalizedContext, options, codexSessionId, grammarToolInputProperties);
+			const cacheAffinityId = clampOpenAIPromptCacheKey(cacheSessionId);
+			const providerThinkingLevel = model.compat?.supportsReasoningEffortUpdates
+				? resolveReasoningEffort(model, options)
+				: undefined;
+			let body = buildRequestBody(model, normalizedContext, options, cacheAffinityId, grammarToolInputProperties);
 			const nextBody = await options?.onPayload?.(body, model);
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
-			const websocketRequestId = codexSessionId || uuidv7();
-			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
+			const requestId = cacheSessionId || uuidv7();
+			const sseHeaders = buildSSEHeaders(
+				model.headers,
+				options?.headers,
+				accountId,
+				apiKey,
+				cacheAffinityId,
+				cacheSessionId,
+			);
 			const websocketHeaders = buildWebSocketHeaders(
 				model.headers,
 				options?.headers,
 				accountId,
 				apiKey,
-				websocketRequestId,
+				cacheAffinityId ?? requestId,
+				requestId,
 			);
 			const bodyJson = JSON.stringify(body);
 			const httpTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
@@ -331,6 +365,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							throw new Error("Request was aborted");
 						}
 						assertSuccessfulOutput(output);
+						if (providerThinkingLevel !== undefined) output.providerThinkingLevel = providerThinkingLevel;
 						stream.push({
 							type: "done",
 							reason: output.stopReason,
@@ -479,6 +514,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			}
 
 			assertSuccessfulOutput(output);
+			if (providerThinkingLevel !== undefined) output.providerThinkingLevel = providerThinkingLevel;
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -538,6 +574,11 @@ function buildRequestBody(
 	const supportsOpenAIGrammarTools = model.compat?.supportsOpenAIGrammarTools ?? false;
 	const supportsAdditionalTools = model.compat?.supportsAdditionalTools ?? false;
 	const supportsToolSearch = model.compat?.supportsToolSearch ?? false;
+	const activeReasoningEffort = resolveReasoningEffort(model, options);
+	const reasoningEffortState =
+		model.compat?.supportsReasoningEffortUpdates === true && activeReasoningEffort !== undefined
+			? getResponsesReasoningEffortState(model, context.messages, activeReasoningEffort)
+			: undefined;
 	const transcriptTools = resolveTranscriptTools(context.messages, supportsAdditionalTools || supportsToolSearch);
 	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
@@ -545,8 +586,16 @@ function buildRequestBody(
 		supportsMidConvoSystemMessages: model.compat?.supportsMidConvoSystemMessages ?? false,
 		supportsAdditionalTools,
 		supportsToolSearch,
+		reasoningEffortBaseline: reasoningEffortState?.baselineEffort,
 		toolOptions: { strict: null, supportsStrictMode, supportsOpenAIGrammarTools },
 	});
+	if (
+		reasoningEffortState &&
+		activeReasoningEffort !== undefined &&
+		reasoningEffortState.effectiveEffort !== activeReasoningEffort
+	) {
+		messages.push(createResponsesReasoningEffortUpdate(activeReasoningEffort));
+	}
 
 	const initialSystemMessage = getInitialSystemMessage(context.messages);
 	const instructions = initialSystemMessage ? getSystemMessageText(initialSystemMessage) : "";
@@ -579,21 +628,17 @@ function buildRequestBody(
 		});
 	}
 
-	if (options?.reasoningEffort !== undefined) {
-		const effort =
-			options.reasoningEffort === "none"
-				? model.thinkingLevelMap?.off === undefined
-					? "none"
-					: model.thinkingLevelMap.off
-				: (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort);
+	if (activeReasoningEffort !== undefined) {
+		const effort = reasoningEffortState?.baselineEffort ?? activeReasoningEffort;
 		if (effort !== null) {
+			const offEffort = model.thinkingLevelMap?.off === null ? undefined : (model.thinkingLevelMap?.off ?? "none");
+			const includeReasoningSummary =
+				options?.reasoningEffort !== undefined || options?.reasoningSummary !== undefined || effort !== offEffort;
 			body.reasoning = {
 				effort,
-				summary: options.reasoningSummary ?? "auto",
+				...(includeReasoningSummary ? { summary: options?.reasoningSummary ?? "auto" } : {}),
 			};
 		}
-	} else if (model.reasoning && model.thinkingLevelMap?.off !== null) {
-		body.reasoning = { effort: model.thinkingLevelMap?.off ?? "none" };
 	}
 
 	return body;
@@ -1632,16 +1677,20 @@ function buildSSEHeaders(
 	additionalHeaders: ProviderHeaders | undefined,
 	accountId: string,
 	token: string,
-	sessionId?: string,
+	cacheAffinityId?: string,
+	conversationId?: string,
 ): Headers {
 	const headers = buildBaseCodexHeaders(initHeaders, additionalHeaders, accountId, token);
 	headers.set("OpenAI-Beta", "responses=experimental");
 	headers.set("accept", "text/event-stream");
 	headers.set("content-type", "application/json");
 
-	if (sessionId) {
-		headers.set("session-id", sessionId);
-		headers.set("x-client-request-id", sessionId);
+	if (cacheAffinityId) {
+		headers.set("session-id", cacheAffinityId);
+	}
+	if (conversationId) {
+		headers.set("thread-id", conversationId);
+		headers.set("x-client-request-id", conversationId);
 	}
 
 	return headers;
@@ -1652,7 +1701,8 @@ function buildWebSocketHeaders(
 	additionalHeaders: ProviderHeaders | undefined,
 	accountId: string,
 	token: string,
-	requestId: string,
+	cacheAffinityId: string,
+	conversationId: string,
 ): Headers {
 	const headers = buildBaseCodexHeaders(initHeaders, additionalHeaders, accountId, token);
 	headers.delete("accept");
@@ -1660,7 +1710,8 @@ function buildWebSocketHeaders(
 	headers.delete("OpenAI-Beta");
 	headers.delete("openai-beta");
 	headers.set("OpenAI-Beta", OPENAI_BETA_RESPONSES_WEBSOCKETS);
-	headers.set("x-client-request-id", requestId);
-	headers.set("session-id", requestId);
+	headers.set("x-client-request-id", conversationId);
+	headers.set("thread-id", conversationId);
+	headers.set("session-id", cacheAffinityId);
 	return headers;
 }

@@ -119,6 +119,33 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("OpenAI proxy override drops inherited explicit prompt-cache mode", async () => {
+			writeRawModelsJson({
+				openai: overrideConfig("https://openai-proxy.example.com/v1"),
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			const luna = registry.find("openai", "gpt-6-luna") as Model<"openai-responses"> | undefined;
+
+			expect(luna?.baseUrl).toBe("https://openai-proxy.example.com/v1");
+			expect(luna?.compat?.supportsExplicitPromptCacheMode).toBe(false);
+			expect(luna?.compat?.supportsReasoningEffortUpdates).toBe(true);
+		});
+
+		test("OpenAI proxy can explicitly opt back into explicit prompt-cache mode", async () => {
+			writeRawModelsJson({
+				openai: {
+					baseUrl: "https://openai-proxy.example.com/v1",
+					compat: { supportsExplicitPromptCacheMode: true },
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			const luna = registry.find("openai", "gpt-6-luna") as Model<"openai-responses"> | undefined;
+
+			expect(luna?.compat?.supportsExplicitPromptCacheMode).toBe(true);
+		});
+
 		test("overriding headers resolves at request time", async () => {
 			writeRawModelsJson({
 				anthropic: overrideConfig("https://my-proxy.example.com/v1", {
